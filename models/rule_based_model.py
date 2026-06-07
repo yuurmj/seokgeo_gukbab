@@ -188,12 +188,12 @@ df["rule_risk_score"] = df[score_cols].sum(axis=1)
 
 
 
-#0/1 판별
+# 0/1 판별
 df["rule_decision"] = 0
 df.loc[df["rule_risk_score"] >= DECISION_THRESHOLD, "rule_decision"] = 1
 
 
-#등급 나누기
+# 등급 나누기
 def assign_risk_level(score):
     if score >= 80:
         return "1등급 매우 위험"
@@ -207,7 +207,7 @@ def assign_risk_level(score):
 df["rule_risk_level"] = df["rule_risk_score"].apply(assign_risk_level)
 
 
-#등급 안 우선순위 생성
+# 등급 안 우선순위 생성
 df["rule_priority_rank"] = df.groupby("rule_risk_level")["rule_risk_score"].rank(
     method="first",
     ascending=False
