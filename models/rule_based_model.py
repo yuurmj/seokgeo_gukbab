@@ -1,30 +1,37 @@
 import pandas as pd
 from pathlib import Path
+import sys
+sys.stdout.reconfigure(encoding="utf-8")
 
-# 파일 경로 설정
+
+# 테스트 모드(만 개 제한)
+TEST_MODE = True
+NROWS = 10000
+nrows = NROWS if TEST_MODE else None
+
+
+# step 1
 BASE_DIR = Path(__file__).resolve().parents[1]
-DATA_PATH = BASE_DIR / "data" / "weather_features_by_pole.csv"
+DATA_DIR = BASE_DIR / "data"
 OUTPUT_DIR = BASE_DIR / "outputs"
-
-# 결과 폴더 생성
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-# 데이터 불러오기
-df = pd.read_csv(DATA_PATH)
+STATION_WEATHER_PATH = DATA_DIR / "weather_featured_station_5year_average.csv"
+OUTPUT_PATH = OUTPUT_DIR / "station_weather_risk_score.csv"
 
-# 데이터 확인
-print(df.head())
-print(df.columns)
-print(df.shape)
+station_df = pd.read_csv(STATION_WEATHER_PATH, encoding="utf-8-sig")
 
+print("관측소 기상 데이터 확인")
+print(station_df.head())
+print(station_df.columns)
+print(station_df.shape)
 
-#필수 컬럼들 확인
+# 필수 컬럼 확인
 required_cols = [
-    "pole_id",
-    "pole_lon",
-    "pole_lat",
-    "nearest_station_id",
-    "nearest_station_name",
+    "station_id",
+    "station_name",
+    "region_type",
+    "year_count",
     "avg_temp",
     "max_temp",
     "avg_humidity",
@@ -32,7 +39,6 @@ required_cols = [
     "avg_effective_humidity",
     "min_effective_humidity",
     "total_precipitation",
-    "rain_7days_min",
     "max_consecutive_dry_hours",
     "avg_wind_speed",
     "max_wind_speed",
@@ -42,14 +48,15 @@ required_cols = [
     "yanggan_wind_risk",
 ]
 
-missing_cols = [col for col in required_cols if col not in df.columns]
+missing_cols = [col for col in required_cols if col not in station_df.columns]
 
 if missing_cols:
     raise ValueError(f"누락된 컬럼이 있습니다: {missing_cols}")
 
 
-# 숫자형으로 계산해야 하는 컬럼 목록
+# 숫자형 변환 및 결측치 처리
 numeric_cols = [
+    "year_count",
     "avg_temp",
     "max_temp",
     "avg_humidity",
@@ -57,205 +64,528 @@ numeric_cols = [
     "avg_effective_humidity",
     "min_effective_humidity",
     "total_precipitation",
-    "rain_7days_min",
     "max_consecutive_dry_hours",
     "avg_wind_speed",
     "max_wind_speed",
     "strong_wind_hours",
     "max_vapor_pressure_deficit",
     "max_dew_point_depression",
+    "yanggan_wind_risk",
 ]
 
-# 숫자형 컬럼들을 실제 숫자로 변환
 for col in numeric_cols:
-    df[col] = pd.to_numeric(df[col], errors="coerce")
+    station_df[col] = pd.to_numeric(station_df[col], errors="coerce")
 
-# 숫자형 컬럼의 결측치를 각 컬럼의 중앙값으로 채움
-df[numeric_cols] = df[numeric_cols].fillna(df[numeric_cols].median())
+station_df[numeric_cols] = station_df[numeric_cols].fillna(
+    station_df[numeric_cols].median()
+)
 
-# 양간지풍 위험 여부는 0/1 값이므로 결측치는 0으로 처리
-df["yanggan_wind_risk"] = pd.to_numeric(df["yanggan_wind_risk"], errors="coerce").fillna(0)
-
-
-
-# 점수 가중치 설정
-TEMP_SCORE = 5                  # 기온: 보조 위험 요인
-HUMIDITY_SCORE = 10             # 습도: 건조 위험과 직접 관련
-EFFECTIVE_HUMIDITY_SCORE = 15   # 실효습도: 산불 위험 판단에 중요한 누적 건조도 지표
-RAIN_SCORE = 10                 # 강수 부족: 비가 적을수록 건조 위험 증가
-WIND_SCORE = 10                 # 바람: 화재 확산 위험 반영
-STRONG_WIND_SCORE = 5           # 강풍 지속시간: 강풍 빈도 보조 반영
-DRYNESS_SCORE = 10              # 대기 건조도: 증기압·이슬점 결핍량 반영
-YANGGAN_SCORE = 10              # 양간지풍: 강원 영동 지역 산불 확산 위험 반영
+station_df["yanggan_wind_risk"] = station_df["yanggan_wind_risk"].fillna(0)
 
 
-# 기준값 설정
-AVG_TEMP_THRESHOLD = 25
-MAX_TEMP_THRESHOLD = 30
-AVG_HUMIDITY_THRESHOLD = 45
-MIN_HUMIDITY_THRESHOLD = 30
-AVG_EFFECTIVE_HUMIDITY_THRESHOLD = 50
-MIN_EFFECTIVE_HUMIDITY_THRESHOLD = 35
-TOTAL_PRECIPITATION_THRESHOLD = 20
-RAIN_7DAYS_MIN_THRESHOLD = 5
-DRY_HOURS_THRESHOLD = 72
-AVG_WIND_THRESHOLD = 4
-MAX_WIND_THRESHOLD = 8
-STRONG_WIND_HOURS_THRESHOLD = 24
-MAX_VPD_THRESHOLD = 20
-MAX_DEW_POINT_DEPRESSION_THRESHOLD = 15
-DECISION_THRESHOLD = 60
+
+# 관측소별 기온 점수 계산
+
+# 점수 초기화
+station_df["station_temp_score"] = 0
+station_df["station_humidity_score"] = 0
+station_df["station_effective_humidity_score"] = 0
+station_df["station_rain_score"] = 0
+station_df["station_wind_score"] = 0
+station_df["station_dryness_score"] = 0
+station_df["station_yanggan_score"] = 0
 
 
-#점수 계산
-# 위험 점수 초기화
-df["temp_score"] = 0
-df["humidity_score"] = 0
-df["effective_humidity_score"] = 0
-df["rain_score"] = 0
-df["wind_score"] = 0
-df["dryness_score"] = 0
-df["yanggan_score"] = 0
+
+# 기온 점수
+station_df.loc[station_df["avg_temp"] >= 20, "station_temp_score"] += 2
+station_df.loc[station_df["avg_temp"] >= 25, "station_temp_score"] += 3
+
+station_df.loc[station_df["max_temp"] >= 30, "station_temp_score"] += 3
+station_df.loc[station_df["max_temp"] >= 35, "station_temp_score"] += 4
 
 
-# 평균 기온이 기준 이상이면 고온으로 인한 건조 위험 점수 추가
-df.loc[df["avg_temp"] >= AVG_TEMP_THRESHOLD, "temp_score"] += TEMP_SCORE
 
-# 최고 기온이 기준 이상이면 극단적 고온 위험 점수 추가
-df.loc[df["max_temp"] >= MAX_TEMP_THRESHOLD, "temp_score"] += TEMP_SCORE
+# 습도 점수
+station_df.loc[station_df["avg_humidity"] <= 50, "station_humidity_score"] += 2
+station_df.loc[station_df["avg_humidity"] <= 40, "station_humidity_score"] += 3
 
-
-# 평균 습도가 기준 이하이면 전체적으로 건조한 상태로 보고 위험 점수 추가
-df.loc[df["avg_humidity"] <= AVG_HUMIDITY_THRESHOLD, "humidity_score"] += HUMIDITY_SCORE
-
-# 최저 습도가 기준 이하이면 가장 건조했던 순간의 위험 점수 추가
-df.loc[df["min_humidity"] <= MIN_HUMIDITY_THRESHOLD, "humidity_score"] += HUMIDITY_SCORE
+station_df.loc[station_df["min_humidity"] <= 30, "station_humidity_score"] += 3
+station_df.loc[station_df["min_humidity"] <= 20, "station_humidity_score"] += 4
 
 
-# 평균 실효습도가 기준 이하이면 누적 건조 상태로 보고 위험 점수 추가
-df.loc[df["avg_effective_humidity"] <= AVG_EFFECTIVE_HUMIDITY_THRESHOLD, "effective_humidity_score"] += EFFECTIVE_HUMIDITY_SCORE
 
-# 최저 실효습도가 기준 이하이면 극단적인 산불 위험 건조 상태로 보고 점수 추가
-df.loc[df["min_effective_humidity"] <= MIN_EFFECTIVE_HUMIDITY_THRESHOLD, "effective_humidity_score"] += EFFECTIVE_HUMIDITY_SCORE
+# 실효습도 점수
+station_df.loc[
+    station_df["avg_effective_humidity"] <= 60,
+    "station_effective_humidity_score"
+] += 3
 
+station_df.loc[
+    station_df["avg_effective_humidity"] <= 50,
+    "station_effective_humidity_score"
+] += 4
 
-# 전체 누적 강수량이 기준 이하이면 강수 부족으로 인한 건조 위험 점수 추가
-df.loc[df["total_precipitation"] <= TOTAL_PRECIPITATION_THRESHOLD, "rain_score"] += RAIN_SCORE
+station_df.loc[
+    station_df["min_effective_humidity"] <= 35,
+    "station_effective_humidity_score"
+] += 4
 
-# 가장 건조했던 7일 동안의 강수량이 기준 이하이면 단기 건조 위험 점수 추가
-df.loc[df["rain_7days_min"] <= RAIN_7DAYS_MIN_THRESHOLD, "rain_score"] += RAIN_SCORE
-
-# 비가 오지 않은 시간이 기준 이상으로 길면 장기 건조 위험 점수 추가
-df.loc[df["max_consecutive_dry_hours"] >= DRY_HOURS_THRESHOLD, "rain_score"] += RAIN_SCORE
-
-
-# 평균 풍속이 기준 이상이면 지속적인 바람에 의한 확산 위험 점수 추가
-df.loc[df["avg_wind_speed"] >= AVG_WIND_THRESHOLD, "wind_score"] += WIND_SCORE
-
-# 최대 풍속이 기준 이상이면 순간 강풍에 의한 확산 위험 점수 추가
-df.loc[df["max_wind_speed"] >= MAX_WIND_THRESHOLD, "wind_score"] += WIND_SCORE
-
-# 강풍 시간이 기준 이상이면 강풍 발생 빈도에 따른 위험 점수 추가
-df.loc[df["strong_wind_hours"] >= STRONG_WIND_HOURS_THRESHOLD, "wind_score"] += STRONG_WIND_SCORE
+station_df.loc[
+    station_df["min_effective_humidity"] <= 25,
+    "station_effective_humidity_score"
+] += 5
 
 
-# 최대 증기압 결핍량이 기준 이상이면 대기가 매우 건조한 상태로 보고 위험 점수 추가
-df.loc[df["max_vapor_pressure_deficit"] >= MAX_VPD_THRESHOLD, "dryness_score"] += DRYNESS_SCORE
 
-# 최대 이슬점 결핍량이 기준 이상이면 공기 건조도가 높다고 보고 위험 점수 추가
-df.loc[df["max_dew_point_depression"] >= MAX_DEW_POINT_DEPRESSION_THRESHOLD, "dryness_score"] += DRYNESS_SCORE
+# 강수 점수
+station_df.loc[
+    station_df["total_precipitation"] <= 1200,
+    "station_rain_score"
+] += 3
+
+station_df.loc[
+    station_df["total_precipitation"] <= 1000,
+    "station_rain_score"
+] += 3
+
+station_df.loc[
+    station_df["max_consecutive_dry_hours"] >= 500,
+    "station_rain_score"
+] += 2
+
+station_df.loc[
+    station_df["max_consecutive_dry_hours"] >= 700,
+    "station_rain_score"
+] += 3
 
 
-# 양간지풍 위험 조건에 해당하면 강원 영동 산불 확산 위험 점수 추가
-df.loc[df["yanggan_wind_risk"] == 1, "yanggan_score"] += YANGGAN_SCORE
 
-# 뭐가 주요 원인인지 추정하기 위함
-# 8. 총 위험 점수 계산
-score_cols = [
-    "temp_score",
-    "humidity_score",
-    "effective_humidity_score",
-    "rain_score",
-    "wind_score",
-    "dryness_score",
-    "yanggan_score",
+# 바람 점수
+station_df.loc[station_df["avg_wind_speed"] >= 2, "station_wind_score"] += 2
+station_df.loc[station_df["avg_wind_speed"] >= 3, "station_wind_score"] += 3
+
+station_df.loc[station_df["max_wind_speed"] >= 10, "station_wind_score"] += 4
+station_df.loc[station_df["max_wind_speed"] >= 15, "station_wind_score"] += 5
+
+station_df.loc[station_df["strong_wind_hours"] >= 500, "station_wind_score"] += 2
+station_df.loc[station_df["strong_wind_hours"] >= 800, "station_wind_score"] += 3
+
+
+
+# 대기 건조도 점수
+station_df.loc[
+    station_df["max_vapor_pressure_deficit"] >= 20,
+    "station_dryness_score"
+] += 4
+
+station_df.loc[
+    station_df["max_vapor_pressure_deficit"] >= 30,
+    "station_dryness_score"
+] += 4
+
+station_df.loc[
+    station_df["max_dew_point_depression"] >= 20,
+    "station_dryness_score"
+] += 2
+
+station_df.loc[
+    station_df["max_dew_point_depression"] >= 30,
+    "station_dryness_score"
+] += 3
+
+
+
+# 양간지풍 점수
+station_df.loc[
+    station_df["yanggan_wind_risk"] == 1,
+    "station_yanggan_score"
+] += 5
+
+
+
+# station_weather_risk_score 계산
+station_score_cols = [
+    "station_temp_score",
+    "station_humidity_score",
+    "station_effective_humidity_score",
+    "station_rain_score",
+    "station_wind_score",
+    "station_dryness_score",
+    "station_yanggan_score",
 ]
 
-df["rule_risk_score"] = df[score_cols].sum(axis=1)
-
-# # 점수 최대값 제한
-# df["rule_risk_score"] = df["rule_risk_score"].clip(upper=100)
+station_df["station_weather_risk_score"] = station_df[station_score_cols].sum(axis=1)
 
 
 
-#0/1 판별
-df["rule_decision"] = 0
-df.loc[df["rule_risk_score"] >= DECISION_THRESHOLD, "rule_decision"] = 1
+# 결과 저장
+station_weather_result = station_df[
+    [
+        "station_id",
+        "station_name",
+        "region_type",
+        "station_weather_risk_score",
+        "station_temp_score",
+        "station_humidity_score",
+        "station_effective_humidity_score",
+        "station_rain_score",
+        "station_wind_score",
+        "station_dryness_score",
+        "station_yanggan_score",
+    ]
+].copy()
+
+station_weather_result.to_csv(
+    OUTPUT_PATH,
+    index=False,
+    encoding="utf-8-sig"
+)
+
+print("\n관측소별 기상 위험 점수 생성 완료")
+print(station_weather_result.head())
+
+print("\nstation_weather_risk_score 분포")
+print(station_weather_result["station_weather_risk_score"].describe())
+
+print("\n관측소 위험 점수 순위")
+
+station_rank = station_weather_result.sort_values(
+    "station_weather_risk_score",
+    ascending=False
+).reset_index(drop=True)
+
+station_rank["rank"] = station_rank.index + 1
+
+print(
+    station_rank[
+        [
+            "rank",
+            "station_weather_risk_score",
+            "station_name"
+        ]
+    ]
+)
 
 
-#등급 나누기
-def assign_risk_level(score):
-    if score >= 80:
-        return "1등급 매우 위험"
-    elif score >= 60:
-        return "2등급 위험"
-    elif score >= 40:
-        return "3등급 주의"
-    else:
-        return "4등급 낮음"
+# step 2
+# 전신주별 가까운 관측소 3개 가중치 데이터 읽기
+POLE_STATION_PATH = DATA_DIR / "pole_stations3_add_w.csv"
+POLE_WEATHER_OUTPUT_PATH = OUTPUT_DIR / "pole_weather_risk_score.csv"
 
-df["rule_risk_level"] = df["rule_risk_score"].apply(assign_risk_level)
+pole_df = pd.read_csv(POLE_STATION_PATH, nrows=nrows)
+
+print("\n전신주-관측소 가중치 데이터 확인")
+print(pole_df.head())
+print(pole_df.shape)
+
+# 관측소별 기상 위험 점수를 딕셔너리로 변환
+station_score_dict = dict(
+    zip(
+        station_weather_result["station_id"],
+        station_weather_result["station_weather_risk_score"]
+    )
+)
+
+# 전신주별 가까운 관측소 3개의 위험 점수 매핑
+pole_df["station_score_1"] = pole_df["station_id_1"].map(station_score_dict)
+pole_df["station_score_2"] = pole_df["station_id_2"].map(station_score_dict)
+pole_df["station_score_3"] = pole_df["station_id_3"].map(station_score_dict)
+
+# 관측소 점수가 제대로 매핑되었는지 확인
+station_score_cols = ["station_score_1", "station_score_2", "station_score_3"]
+
+missing_station_score_count = pole_df[station_score_cols].isna().sum().sum()
+
+if missing_station_score_count > 0:
+    missing_rows = pole_df[pole_df[station_score_cols].isna().any(axis=1)]
+    print(missing_rows[["pole_id", "station_id_1", "station_id_2", "station_id_3"]].head(20))
+    raise ValueError("관측소 점수가 매핑되지 않은 전신주가 있습니다.")
+
+# 전신주별 weather_risk_score 계산
+pole_df["weather_risk_score"] = (
+    pole_df["station_score_1"] * pole_df["w1"]
+    + pole_df["station_score_2"] * pole_df["w2"]
+    + pole_df["station_score_3"] * pole_df["w3"]
+)
+
+# 필요한 컬럼만 저장
+pole_weather_result = pole_df[
+    [
+        "pole_id",
+        "lon",
+        "lat",
+        "weather_risk_score"
+    ]
+].copy()
+
+pole_weather_result.to_csv(
+    POLE_WEATHER_OUTPUT_PATH,
+    index=False,
+    encoding="utf-8-sig"
+)
+
+# 결과 확인
+print("\n전신주별 weather_risk_score 생성 완료")
+print(pole_weather_result.head())
+
+print("\nweather_risk_score 통계")
+print(pole_weather_result["weather_risk_score"].describe())
+
+weather_rank = pole_weather_result.sort_values(
+    "weather_risk_score",
+    ascending=False
+).reset_index(drop=True)
+
+weather_rank["rank"] = weather_rank.index + 1
+
+print("\n전신주 weather_risk_score 상위 20개")
+print(
+    weather_rank[
+        [
+            "rank",
+            "pole_id",
+            "weather_risk_score"
+        ]
+    ].head(20)
+)
 
 
-#등급 안 우선순위 생성
-df["rule_priority_rank"] = df.groupby("rule_risk_level")["rule_risk_score"].rank(
+# step 3
+# 공간 변수 파일 경로 설정
+FOREST_DISTANCE_PATH = DATA_DIR / "pole_distance_selected.csv"
+FOREST_AREA_PATH = DATA_DIR / "gangwon_pole_scaled_risk.csv"
+SLOPE_PATH = DATA_DIR / "slope_mean.csv"
+HEIGHT_PATH = DATA_DIR / "pole_locations_with_height.csv"
+
+SPATIAL_OUTPUT_PATH = OUTPUT_DIR / "pole_spatial_risk_score.csv"
+
+# 전신주별 weather_risk_score 결과 읽기
+weather_df = pd.read_csv(POLE_WEATHER_OUTPUT_PATH, nrows=nrows)
+
+# 공간 변수 데이터 읽기
+distance_df = pd.read_csv(FOREST_DISTANCE_PATH, nrows=nrows)
+area_df = pd.read_csv(FOREST_AREA_PATH, nrows=nrows)
+slope_df = pd.read_csv(SLOPE_PATH, nrows=nrows)
+height_df = pd.read_csv(HEIGHT_PATH, nrows=nrows)
+
+# 필요한 컬럼만 선택하고 컬럼명 정리
+distance_df = distance_df[["pole_id", "distance"]].rename(
+    columns={"distance": "forest_distance"}
+)
+
+area_df = area_df[["pole_id", "f_area_sum"]].rename(
+    columns={"f_area_sum": "forest_area"}
+)
+
+slope_df = slope_df[["pole_id", "slopemean"]].rename(
+    columns={"slopemean": "pole_slope"}
+)
+
+height_df = height_df[["pole_id", "height1"]].rename(
+    columns={"height1": "pole_height"}
+)
+
+# pole_id 기준으로 weather 결과와 공간 변수 병합
+spatial_df = weather_df.merge(distance_df, on="pole_id", how="left")
+spatial_df = spatial_df.merge(area_df, on="pole_id", how="left")
+spatial_df = spatial_df.merge(slope_df, on="pole_id", how="left")
+spatial_df = spatial_df.merge(height_df, on="pole_id", how="left")
+
+# 공간 변수 누락 여부 확인
+spatial_cols = [
+    "forest_distance",
+    "forest_area",
+    "pole_slope",
+    "pole_height",
+]
+
+missing_spatial_count = spatial_df[spatial_cols].isna().sum().sum()
+
+if missing_spatial_count > 0:
+    missing_rows = spatial_df[spatial_df[spatial_cols].isna().any(axis=1)]
+    print(missing_rows[["pole_id"] + spatial_cols].head(20))
+    raise ValueError("공간 변수가 매핑되지 않은 전신주가 있습니다.")
+
+# 숫자형 변환
+for col in spatial_cols:
+    spatial_df[col] = pd.to_numeric(spatial_df[col], errors="coerce")
+
+# 공간 점수 초기화
+spatial_df["forest_distance_score"] = 0
+spatial_df["forest_area_score"] = 0
+spatial_df["pole_slope_score"] = 0
+spatial_df["pole_height_score"] = 0
+
+# 산림거리 점수: 산림과 가까울수록 위험
+spatial_df.loc[spatial_df["forest_distance"] <= 500, "forest_distance_score"] += 2
+spatial_df.loc[spatial_df["forest_distance"] <= 100, "forest_distance_score"] += 3
+spatial_df.loc[spatial_df["forest_distance"] <= 50, "forest_distance_score"] += 4
+spatial_df.loc[spatial_df["forest_distance"] <= 30, "forest_distance_score"] += 5
+
+# 산림면적 점수: 주변 산림 면적이 클수록 위험
+spatial_df.loc[spatial_df["forest_area"] >= 500000, "forest_area_score"] += 2
+spatial_df.loc[spatial_df["forest_area"] >= 1000000, "forest_area_score"] += 3
+spatial_df.loc[spatial_df["forest_area"] >= 3000000, "forest_area_score"] += 4
+spatial_df.loc[spatial_df["forest_area"] >= 5000000, "forest_area_score"] += 5
+
+# 경사도 점수: 경사가 클수록 확산 위험 증가
+spatial_df.loc[spatial_df["pole_slope"] >= 10, "pole_slope_score"] += 2
+spatial_df.loc[spatial_df["pole_slope"] >= 20, "pole_slope_score"] += 3
+spatial_df.loc[spatial_df["pole_slope"] >= 30, "pole_slope_score"] += 4
+
+# 고도 점수: 보조 지형 변수로 낮은 비중 반영
+spatial_df.loc[spatial_df["pole_height"] >= 300, "pole_height_score"] += 1
+spatial_df.loc[spatial_df["pole_height"] >= 600, "pole_height_score"] += 2
+spatial_df.loc[spatial_df["pole_height"] >= 900, "pole_height_score"] += 2
+
+# spatial_risk_score 계산
+spatial_score_cols = [
+    "forest_distance_score",
+    "forest_area_score",
+    "pole_slope_score",
+    "pole_height_score",
+]
+
+spatial_df["spatial_risk_score"] = spatial_df[spatial_score_cols].sum(axis=1)
+
+# 필요한 컬럼만 저장
+spatial_result = spatial_df[
+    [
+        "pole_id",
+        "lon",
+        "lat",
+        "weather_risk_score",
+        "forest_distance",
+        "forest_area",
+        "pole_slope",
+        "pole_height",
+        "spatial_risk_score",
+    ]
+].copy()
+
+spatial_result.to_csv(
+    SPATIAL_OUTPUT_PATH,
+    index=False,
+    encoding="utf-8-sig"
+)
+
+# 결과 확인
+print("\n전신주별 spatial_risk_score 생성 완료")
+print(spatial_result.head())
+
+print("\nspatial_risk_score 통계")
+print(spatial_result["spatial_risk_score"].describe())
+
+
+# step 4
+# 최종 결과 파일 경로 설정
+FINAL_OUTPUT_PATH = OUTPUT_DIR / "final_risk_result.csv"
+SUBMISSION_OUTPUT_PATH = OUTPUT_DIR / "submission.csv"
+
+# 최종 위험도 계산용 데이터 읽기
+final_df = pd.read_csv(SPATIAL_OUTPUT_PATH, nrows=nrows)
+
+print("\n최종 위험도 계산 시작")
+print(final_df.shape)
+
+# 최종 위험도 계산
+final_df["final_risk_score"] = (
+    final_df["weather_risk_score"]
+    + final_df["spatial_risk_score"]
+)
+
+# 위험 여부 판단 기준 설정
+decision_threshold = final_df["final_risk_score"].median()
+
+# 위험 여부 0/1 생성
+final_df["decision"] = (
+    final_df["final_risk_score"] >= decision_threshold
+).astype(int)
+
+# 위험도 4등급 생성
+final_df["risk_level"] = pd.qcut(
+    final_df["final_risk_score"],
+    q=4,
+    labels=[
+        "4(낮음)",
+        "3(보통)",
+        "2(높음)",
+        "1(매우높음)"
+    ]
+)
+
+# 등급 안 우선순위 생성
+final_df["priority_rank"] = final_df.groupby("risk_level")["final_risk_score"].rank(
     method="first",
     ascending=False
 ).astype(int)
 
+# 분석용 최종 결과 저장
+final_result = final_df[
+    [
+        "pole_id",
+        "lon",
+        "lat",
+        "weather_risk_score",
+        "spatial_risk_score",
+        "final_risk_score",
+        "decision",
+        "risk_level",
+        "priority_rank"
+    ]
+].copy()
 
-#결과 저장
-result_path = OUTPUT_DIR / "rule_based_result.csv"
-submission_path = OUTPUT_DIR / "submission.csv"
+final_result.to_csv(
+    FINAL_OUTPUT_PATH,
+    index=False,
+    encoding="utf-8-sig"
+)
 
-df.to_csv(result_path, index=False, encoding="utf-8-sig")
+# 제출용 파일 저장
+submission = final_df[
+    [
+        "pole_id",
+        "lon",
+        "lat",
+        "decision"
+    ]
+].copy()
 
-submission = df[["pole_id", "pole_lon", "pole_lat", "rule_decision"]].copy()
-submission = submission.rename(columns={
-    "pole_lon": "lon",
-    "pole_lat": "lat",
-    "rule_decision": "decision"
-})
+submission.to_csv(
+    SUBMISSION_OUTPUT_PATH,
+    index=False,
+    encoding="utf-8-sig"
+)
 
-submission.to_csv(submission_path, index=False, encoding="utf-8-sig")
-
-print("규칙기반모델 결과 생성 완료")
-print(df[["pole_id", "rule_risk_score", "rule_decision", "rule_risk_level", "rule_priority_rank"]].head())
-
-
-
-# 확인용
-print("\n위험등급 분포")
-print(df["rule_risk_level"].value_counts())
+# 결과 확인
+print("\n최종 위험도 생성 완료")
 
 print("\ndecision 분포")
-print(df["rule_decision"].value_counts())
+print(final_result["decision"].value_counts())
 
-print("\n상위 위험 전신주 10개")
+print("\nrisk_level 분포")
+print(final_result["risk_level"].value_counts())
+
+print("\n제출용 submission.csv 생성 완료")
+print(submission.head())
+
+# 최종 위험도 순위 확인
+final_rank = final_result.sort_values(
+    "final_risk_score",
+    ascending=False
+).reset_index(drop=True)
+
+final_rank["rank"] = final_rank.index + 1
+
+print("\n최종 위험도 상위 20개")
 print(
-    df[
+    final_rank[
         [
+            "rank",
             "pole_id",
-            "rule_risk_score",
-            "rule_decision",
-            "rule_risk_level",
-            "rule_priority_rank",
-            "temp_score",
-            "humidity_score",
-            "rain_score",
-            "wind_score",
-            "dryness_score",
-            "yanggan_score",
+            "final_risk_score",
+            "risk_level"
         ]
-    ].sort_values("rule_risk_score", ascending=False).head(10)
+    ].head(20)
 )
