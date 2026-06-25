@@ -666,15 +666,26 @@ final_df["decision"] = (
 
 
 # 위험도 4등급 생성
-final_df["risk_level"] = pd.qcut(
-    final_df["final_risk_score"],
-    q=4,
+# 1(매우높음) = decision==1 (점검 대상으로 찍은 전신주)
+# 나머지(decision==0)는 final_risk_score 기준으로 3등분 → 2(높음)/3(보통)/4(낮음)
+final_df["risk_level"] = "1(매우높음)"
+
+decision_zero_mask = final_df["decision"] == 0
+final_df.loc[decision_zero_mask, "risk_level"] = pd.qcut(
+    final_df.loc[decision_zero_mask, "final_risk_score"].rank(method="first"),
+    q=3,
     labels=[
         "4(낮음)",
         "3(보통)",
-        "2(높음)",
-        "1(매우높음)"
+        "2(높음)"
     ]
+).astype(str)
+
+# 등급을 1→4 순서가 유지되는 범주형으로 정리
+final_df["risk_level"] = pd.Categorical(
+    final_df["risk_level"],
+    categories=["1(매우높음)", "2(높음)", "3(보통)", "4(낮음)"],
+    ordered=True
 )
 
 
