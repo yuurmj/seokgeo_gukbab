@@ -1,2 +1,3 @@
 data/*.csv
 outputs/*.csv
+outputs/weight_tuning/*.csv
