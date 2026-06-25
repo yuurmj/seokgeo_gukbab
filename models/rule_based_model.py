@@ -1,4 +1,5 @@
 # 라이브러리 불러오기 및 한글 출력 설정
+import json
 import pandas as pd
 from pathlib import Path
 import sys
@@ -7,7 +8,7 @@ sys.stdout.reconfigure(encoding="utf-8")
 
 
 # 테스트 모드 설정
-TEST_MODE = True
+TEST_MODE = False
 NROWS = 10000
 nrows = NROWS if TEST_MODE else None
 
@@ -17,6 +18,7 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
 OUTPUT_DIR = BASE_DIR / "outputs"
 OUTPUT_DIR.mkdir(exist_ok=True)
+WEIGHT_TUNING_PATH = OUTPUT_DIR / "weight_tuning" / "recommended_weight_threshold.json"
 
 
 # 0~1 정규화 함수
@@ -82,6 +84,36 @@ SPATIAL_ELEVATION_WEIGHT = 0.08
 FINAL_WEATHER_WEIGHT = 0.50
 FINAL_SPATIAL_WEIGHT = 0.30
 FINAL_INTERACTION_WEIGHT = 0.20
+FINAL_TOP_RATE = None
+
+
+# 가중치 튜닝 결과 적용
+if WEIGHT_TUNING_PATH.exists():
+    with WEIGHT_TUNING_PATH.open(encoding="utf-8") as file:
+        tuned = json.load(file)
+
+    FINAL_WEATHER_WEIGHT = tuned.get(
+        "weight_weather_risk_score",
+        FINAL_WEATHER_WEIGHT,
+    )
+    FINAL_SPATIAL_WEIGHT = tuned.get(
+        "weight_spatial_risk_score",
+        FINAL_SPATIAL_WEIGHT,
+    )
+    FINAL_INTERACTION_WEIGHT = tuned.get(
+        "weight_interaction_risk_score",
+        FINAL_INTERACTION_WEIGHT,
+    )
+    FINAL_TOP_RATE = tuned.get("train_top_rate", tuned.get("top_rate"))
+
+    print("\n가중치 튜닝 결과 적용")
+    print(f"- weather: {FINAL_WEATHER_WEIGHT:.4f}")
+    print(f"- spatial: {FINAL_SPATIAL_WEIGHT:.4f}")
+    print(f"- interaction: {FINAL_INTERACTION_WEIGHT:.4f}")
+    if FINAL_TOP_RATE is not None:
+        print(f"- decision top_rate: {FINAL_TOP_RATE:.4f}")
+else:
+    print("\n가중치 튜닝 결과 없음: 기본 최종위험도 가중치 사용")
 
 
 # 사용할 기상 데이터 선택
@@ -618,7 +650,10 @@ final_df["final_risk_score"] = (
 
 
 # 위험 여부 판단 기준 설정
-decision_threshold = final_df["final_risk_score"].median()
+if FINAL_TOP_RATE is None:
+    decision_threshold = final_df["final_risk_score"].median()
+else:
+    decision_threshold = final_df["final_risk_score"].quantile(1 - FINAL_TOP_RATE)
 
 
 # 최종 위험 여부 생성
