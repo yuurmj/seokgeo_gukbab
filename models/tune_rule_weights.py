@@ -23,7 +23,7 @@ except ImportError:
 
 # 규칙 기반 모델 가중치 보조 분석
 # 1) 규칙 기반 결과 CSV 로드
-# 2) 기상/공간 위험 점수 정리
+# 2) 기상/공간/상호작용 위험 점수 정리
 # 3) 산불 이력 proxy label 생성
 # 4) Logistic Regression 기반 선형 방향성 진단
 # 5) LightGBM + SHAP 기반 중요도 비교
@@ -31,7 +31,12 @@ except ImportError:
 # 7) Optuna 기반 가중치/threshold 후보 탐색
 # 8) 2024년 산불 proxy 기준 최종 검증
 
-DEFAULT_RULE_INPUT = BASE_DIR / "outputs" / "pole_spatial_risk_score.csv"
+DEFAULT_RULE_CANDIDATES = [
+    BASE_DIR / "outputs" / "final_risk_result_train.csv",
+    BASE_DIR / "outputs" / "pole_spatial_risk_score_train.csv",
+    BASE_DIR / "outputs" / "final_risk_result.csv",
+    BASE_DIR / "outputs" / "pole_spatial_risk_score.csv",
+]
 DEFAULT_FIRE_INPUT = BASE_DIR / "data" / "fire_history.csv"
 DEFAULT_OUTPUT_DIR = BASE_DIR / "outputs" / "weight_tuning"
 
@@ -39,6 +44,7 @@ DEFAULT_OUTPUT_DIR = BASE_DIR / "outputs" / "weight_tuning"
 COMPONENT_COLUMNS = [
     "weather_risk_score",
     "spatial_risk_score",
+    "interaction_risk_score",
 ]
 
 
@@ -52,6 +58,14 @@ def require_columns(data, columns, data_name):
     missing = [column for column in columns if column not in data.columns]
     if missing:
         raise ValueError(f"{data_name}에 필요한 컬럼이 없습니다: {missing}")
+
+
+def resolve_default_rule_input():
+    """규칙 기반 결과 기본 파일 선택."""
+    for path in DEFAULT_RULE_CANDIDATES:
+        if path.exists():
+            return path
+    return DEFAULT_RULE_CANDIDATES[0]
 
 
 def prepare_rule_scores(data):
@@ -69,9 +83,16 @@ def prepare_rule_scores(data):
     )
 
     result = data.copy()
+    if "interaction_risk_score" not in result.columns:
+        result["interaction_risk_score"] = (
+            pd.to_numeric(result["weather_risk_score"], errors="coerce")
+            * pd.to_numeric(result["spatial_risk_score"], errors="coerce")
+        )
+
     numeric_columns = [
         "weather_risk_score",
         "spatial_risk_score",
+        "interaction_risk_score",
     ]
     for column in numeric_columns:
         result[column] = pd.to_numeric(result[column], errors="coerce")
@@ -334,7 +355,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Tune rule-based risk weights with fire proxy labels."
     )
-    parser.add_argument("--rule-input", default=str(DEFAULT_RULE_INPUT))
+    parser.add_argument("--rule-input", default=str(resolve_default_rule_input()))
     parser.add_argument("--fire-input", default=str(DEFAULT_FIRE_INPUT))
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
     parser.add_argument("--radius-km", type=float, default=3.0)
@@ -356,7 +377,8 @@ def main():
     if not rule_path.exists():
         raise FileNotFoundError(
             f"규칙 기반 결과 파일이 없습니다: {rule_path}\n"
-            "먼저 models/rule_based_model.py를 실행해 pole_spatial_risk_score.csv를 생성하세요."
+            "먼저 models/rule_based_model.py를 실행해 final_risk_result_train.csv "
+            "또는 pole_spatial_risk_score_train.csv를 생성하세요."
         )
     if not fire_path.exists():
         raise FileNotFoundError(f"산불 이력 파일이 없습니다: {fire_path}")
