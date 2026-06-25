@@ -1,0 +1,10 @@
+{
+  "accuracy": 0.5935,
+  "precision": 0.010108481262327416,
+  "recall": 0.45054945054945056,
+  "f1": 0.019773330118157705,
+  "positive_rate": 0.4056,
+  "selected_count": 4056,
+  "proxy_total": 91,
+  "captured_proxy_count": 41
+}
