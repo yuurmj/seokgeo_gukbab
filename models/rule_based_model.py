@@ -19,6 +19,71 @@ OUTPUT_DIR = BASE_DIR / "outputs"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 
+# 0~1 정규화 함수
+def minmax(series):
+    min_value = series.min()
+    max_value = series.max()
+
+    if max_value == min_value:
+        return pd.Series(0, index=series.index)
+
+    return (series - min_value) / (max_value - min_value)
+
+
+# 값이 클수록 위험한 변수
+def risk_high(series):
+    return minmax(series)
+
+
+# 값이 작을수록 위험한 변수
+def risk_low(series):
+    return 1 - minmax(series)
+
+
+# 기상위험도 상위 가중치
+WEATHER_DRYNESS_WEIGHT = 0.55
+WEATHER_WIND_WEIGHT = 0.30
+WEATHER_TEMPERATURE_WEIGHT = 0.15
+
+
+# 건조위험도 내부 가중치
+DRY_AVG_HUMIDITY_WEIGHT = 0.15
+DRY_MIN_HUMIDITY_WEIGHT = 0.15
+DRY_AVG_EFFECTIVE_HUMIDITY_WEIGHT = 0.20
+DRY_MIN_EFFECTIVE_HUMIDITY_WEIGHT = 0.20
+DRY_TOTAL_PRECIPITATION_WEIGHT = 0.10
+DRY_CONSECUTIVE_DRY_HOURS_WEIGHT = 0.10
+DRY_VAPOR_PRESSURE_DEFICIT_WEIGHT = 0.10
+
+
+# 바람위험도 내부 가중치
+WIND_AVG_WIND_SPEED_WEIGHT = 0.25
+WIND_MAX_WIND_SPEED_WEIGHT = 0.30
+WIND_STRONG_WIND_HOURS_WEIGHT = 0.25
+WIND_YANGGAN_WEIGHT = 0.20
+
+
+# 고온위험도 내부 가중치
+TEMP_AVG_TEMP_WEIGHT = 0.40
+TEMP_MAX_TEMP_WEIGHT = 0.60
+
+
+# 공간위험도 가중치
+SPATIAL_RATIO_100M_WEIGHT = 0.18
+SPATIAL_RATIO_300M_WEIGHT = 0.24
+SPATIAL_RATIO_500M_WEIGHT = 0.06
+SPATIAL_DISTANCE_WEIGHT = 0.15
+SPATIAL_SCALED_WEIGHT = 0.15
+SPATIAL_SLOPE_WEIGHT = 0.14
+SPATIAL_ELEVATION_WEIGHT = 0.08
+
+
+# 최종위험도 가중치
+FINAL_WEATHER_WEIGHT = 0.50
+FINAL_SPATIAL_WEIGHT = 0.30
+FINAL_INTERACTION_WEIGHT = 0.20
+
+
 # 사용할 기상 데이터 선택
 WEATHER_MODE = "train" 
 
@@ -65,7 +130,7 @@ required_cols = [
     "max_wind_speed",
     "strong_wind_hours",
     "max_vapor_pressure_deficit",
-    "max_dew_point_depression",
+    "max_dew_point_depression",  # max_dew_point_depression은 참고 변수로 보유하되, 현재 기상위험도 가중식에는 반영하지 않음
     "yanggan_wind_risk",
 ]
 
@@ -94,6 +159,8 @@ numeric_cols = [
     "yanggan_wind_risk",
 ]
 
+
+#숫자 변환, 결측치 처리
 for col in numeric_cols:
     station_df[col] = pd.to_numeric(station_df[col], errors="coerce")
 
@@ -104,128 +171,58 @@ station_df[numeric_cols] = station_df[numeric_cols].fillna(
 station_df["yanggan_wind_risk"] = station_df["yanggan_wind_risk"].fillna(0)
 
 
-# 관측소별 기상 점수 컬럼 초기화
-station_df["station_temp_score"] = 0
-station_df["station_humidity_score"] = 0
-station_df["station_effective_humidity_score"] = 0
-station_df["station_rain_score"] = 0
-station_df["station_wind_score"] = 0
-station_df["station_dryness_score"] = 0
-station_df["station_yanggan_score"] = 0
+# 기상 변수별 0~1 위험값 생성
+station_df["avg_humidity_risk"] = risk_low(station_df["avg_humidity"])
+station_df["min_humidity_risk"] = risk_low(station_df["min_humidity"])
+station_df["avg_effective_humidity_risk"] = risk_low(station_df["avg_effective_humidity"])
+station_df["min_effective_humidity_risk"] = risk_low(station_df["min_effective_humidity"])
+station_df["total_precipitation_risk"] = risk_low(station_df["total_precipitation"])
+station_df["max_consecutive_dry_hours_risk"] = risk_high(station_df["max_consecutive_dry_hours"])
+station_df["max_vapor_pressure_deficit_risk"] = risk_high(station_df["max_vapor_pressure_deficit"])
+
+station_df["avg_wind_speed_risk"] = risk_high(station_df["avg_wind_speed"])
+station_df["max_wind_speed_risk"] = risk_high(station_df["max_wind_speed"])
+station_df["strong_wind_hours_risk"] = risk_high(station_df["strong_wind_hours"])
+station_df["yanggan_wind_risk_value"] = station_df["yanggan_wind_risk"]
+
+station_df["avg_temp_risk"] = risk_high(station_df["avg_temp"])
+station_df["max_temp_risk"] = risk_high(station_df["max_temp"])
 
 
-# 기온 점수 계산
-station_df.loc[station_df["avg_temp"] >= 20, "station_temp_score"] += 2
-station_df.loc[station_df["avg_temp"] >= 25, "station_temp_score"] += 3
-
-station_df.loc[station_df["max_temp"] >= 30, "station_temp_score"] += 3
-station_df.loc[station_df["max_temp"] >= 35, "station_temp_score"] += 4
-
-
-# 습도 점수 계산
-station_df.loc[station_df["avg_humidity"] <= 50, "station_humidity_score"] += 2
-station_df.loc[station_df["avg_humidity"] <= 40, "station_humidity_score"] += 3
-
-station_df.loc[station_df["min_humidity"] <= 30, "station_humidity_score"] += 3
-station_df.loc[station_df["min_humidity"] <= 20, "station_humidity_score"] += 4
+# 건조위험도 계산
+station_df["dryness_risk"] = (
+    station_df["avg_humidity_risk"] * DRY_AVG_HUMIDITY_WEIGHT
+    + station_df["min_humidity_risk"] * DRY_MIN_HUMIDITY_WEIGHT
+    + station_df["avg_effective_humidity_risk"] * DRY_AVG_EFFECTIVE_HUMIDITY_WEIGHT
+    + station_df["min_effective_humidity_risk"] * DRY_MIN_EFFECTIVE_HUMIDITY_WEIGHT
+    + station_df["total_precipitation_risk"] * DRY_TOTAL_PRECIPITATION_WEIGHT
+    + station_df["max_consecutive_dry_hours_risk"] * DRY_CONSECUTIVE_DRY_HOURS_WEIGHT
+    + station_df["max_vapor_pressure_deficit_risk"] * DRY_VAPOR_PRESSURE_DEFICIT_WEIGHT
+)
 
 
-# 실효습도 점수 계산
-station_df.loc[
-    station_df["avg_effective_humidity"] <= 60,
-    "station_effective_humidity_score"
-] += 3
-
-station_df.loc[
-    station_df["avg_effective_humidity"] <= 50,
-    "station_effective_humidity_score"
-] += 4
-
-station_df.loc[
-    station_df["min_effective_humidity"] <= 35,
-    "station_effective_humidity_score"
-] += 4
-
-station_df.loc[
-    station_df["min_effective_humidity"] <= 25,
-    "station_effective_humidity_score"
-] += 5
+# 바람위험도 계산
+station_df["wind_risk"] = (
+    station_df["avg_wind_speed_risk"] * WIND_AVG_WIND_SPEED_WEIGHT
+    + station_df["max_wind_speed_risk"] * WIND_MAX_WIND_SPEED_WEIGHT
+    + station_df["strong_wind_hours_risk"] * WIND_STRONG_WIND_HOURS_WEIGHT
+    + station_df["yanggan_wind_risk_value"] * WIND_YANGGAN_WEIGHT
+)
 
 
-# 강수 및 연속 건조 시간 점수 계산
-station_df.loc[
-    station_df["total_precipitation"] <= 1200,
-    "station_rain_score"
-] += 3
-
-station_df.loc[
-    station_df["total_precipitation"] <= 1000,
-    "station_rain_score"
-] += 3
-
-station_df.loc[
-    station_df["max_consecutive_dry_hours"] >= 500,
-    "station_rain_score"
-] += 2
-
-station_df.loc[
-    station_df["max_consecutive_dry_hours"] >= 700,
-    "station_rain_score"
-] += 3
+# 고온위험도 계산
+station_df["temperature_risk"] = (
+    station_df["avg_temp_risk"] * TEMP_AVG_TEMP_WEIGHT
+    + station_df["max_temp_risk"] * TEMP_MAX_TEMP_WEIGHT
+)
 
 
-# 바람 점수 계산
-station_df.loc[station_df["avg_wind_speed"] >= 2, "station_wind_score"] += 2
-station_df.loc[station_df["avg_wind_speed"] >= 3, "station_wind_score"] += 3
-
-station_df.loc[station_df["max_wind_speed"] >= 10, "station_wind_score"] += 4
-station_df.loc[station_df["max_wind_speed"] >= 15, "station_wind_score"] += 5
-
-station_df.loc[station_df["strong_wind_hours"] >= 500, "station_wind_score"] += 2
-station_df.loc[station_df["strong_wind_hours"] >= 800, "station_wind_score"] += 3
-
-
-# 대기 건조도 점수 계산
-station_df.loc[
-    station_df["max_vapor_pressure_deficit"] >= 20,
-    "station_dryness_score"
-] += 4
-
-station_df.loc[
-    station_df["max_vapor_pressure_deficit"] >= 30,
-    "station_dryness_score"
-] += 4
-
-station_df.loc[
-    station_df["max_dew_point_depression"] >= 20,
-    "station_dryness_score"
-] += 2
-
-station_df.loc[
-    station_df["max_dew_point_depression"] >= 30,
-    "station_dryness_score"
-] += 3
-
-
-# 양간지풍 점수 계산
-station_df.loc[
-    station_df["yanggan_wind_risk"] == 1,
-    "station_yanggan_score"
-] += 5
-
-
-# 관측소별 최종 기상 위험 점수 계산
-station_score_cols = [
-    "station_temp_score",
-    "station_humidity_score",
-    "station_effective_humidity_score",
-    "station_rain_score",
-    "station_wind_score",
-    "station_dryness_score",
-    "station_yanggan_score",
-]
-
-station_df["station_weather_risk_score"] = station_df[station_score_cols].sum(axis=1)
+# 관측소별 최종 기상위험도 계산
+station_df["station_weather_risk_score"] = (
+    station_df["dryness_risk"] * WEATHER_DRYNESS_WEIGHT
+    + station_df["wind_risk"] * WEATHER_WIND_WEIGHT
+    + station_df["temperature_risk"] * WEATHER_TEMPERATURE_WEIGHT
+)
 
 
 # 관측소별 기상 위험 점수 결과 저장
@@ -235,13 +232,22 @@ station_weather_result = station_df[
         "station_name",
         "region_type",
         "station_weather_risk_score",
-        "station_temp_score",
-        "station_humidity_score",
-        "station_effective_humidity_score",
-        "station_rain_score",
-        "station_wind_score",
-        "station_dryness_score",
-        "station_yanggan_score",
+        "dryness_risk",
+        "wind_risk",
+        "temperature_risk",
+        "avg_humidity_risk",
+        "min_humidity_risk",
+        "avg_effective_humidity_risk",
+        "min_effective_humidity_risk",
+        "total_precipitation_risk",
+        "max_consecutive_dry_hours_risk",
+        "max_vapor_pressure_deficit_risk",
+        "avg_wind_speed_risk",
+        "max_wind_speed_risk",
+        "strong_wind_hours_risk",
+        "yanggan_wind_risk_value",
+        "avg_temp_risk",
+        "max_temp_risk",
     ]
 ].copy()
 
@@ -498,149 +504,30 @@ if missing_after_numeric_count > 0:
     raise ValueError("공간 변수 숫자형 변환 과정에서 결측치가 발생했습니다.")
 
 
-# 공간 점수 컬럼 초기화
-spatial_df["forest_distance_score"] = 0
-spatial_df["spatial_risk_scaled_score"] = 0
-spatial_df["forest_ratio_score"] = 0
-spatial_df["pole_slope_score"] = 0
-spatial_df["pole_height_score"] = 0
+# 공간 변수별 0~1 위험값 생성
+spatial_df["forest_ratio_100m_risk"] = risk_high(spatial_df["forest_ratio_100m"])
+spatial_df["forest_ratio_300m_risk"] = risk_high(spatial_df["forest_ratio_300m"])
+spatial_df["forest_ratio_500m_risk"] = risk_high(spatial_df["forest_ratio_500m"])
+
+spatial_df["forest_distance_risk"] = risk_low(spatial_df["forest_distance"])
+
+# spatial_risk_scaled는 이미 0~1 위험값이므로 그대로 사용
+spatial_df["spatial_risk_scaled_risk"] = spatial_df["spatial_risk_scaled"]
+
+spatial_df["slope_risk"] = risk_high(spatial_df["pole_slope"])
+spatial_df["elevation_risk"] = risk_high(spatial_df["pole_height"])
 
 
-# 산림거리 점수 계산: 산림과 가까울수록 위험
-spatial_df.loc[
-    spatial_df["forest_distance"] <= 500,
-    "forest_distance_score"
-] += 2
-
-spatial_df.loc[
-    spatial_df["forest_distance"] <= 100,
-    "forest_distance_score"
-] += 3
-
-spatial_df.loc[
-    spatial_df["forest_distance"] <= 50,
-    "forest_distance_score"
-] += 4
-
-spatial_df.loc[
-    spatial_df["forest_distance"] <= 30,
-    "forest_distance_score"
-] += 5
-
-
-# 산림 전체 크기 점수 계산: spatial_risk_scaled가 클수록 위험
-spatial_df.loc[
-    spatial_df["spatial_risk_scaled"] >= 0.25,
-    "spatial_risk_scaled_score"
-] += 2
-
-spatial_df.loc[
-    spatial_df["spatial_risk_scaled"] >= 0.50,
-    "spatial_risk_scaled_score"
-] += 3
-
-spatial_df.loc[
-    spatial_df["spatial_risk_scaled"] >= 0.75,
-    "spatial_risk_scaled_score"
-] += 4
-
-spatial_df.loc[
-    spatial_df["spatial_risk_scaled"] >= 0.90,
-    "spatial_risk_scaled_score"
-] += 5
-
-
-# 산림비율 점수 계산: 가까운 반경일수록 더 큰 비중 반영
-spatial_df.loc[
-    spatial_df["forest_ratio_100m"] >= 0.3,
-    "forest_ratio_score"
-] += 2
-
-spatial_df.loc[
-    spatial_df["forest_ratio_100m"] >= 0.5,
-    "forest_ratio_score"
-] += 3
-
-spatial_df.loc[
-    spatial_df["forest_ratio_100m"] >= 0.7,
-    "forest_ratio_score"
-] += 4
-
-spatial_df.loc[
-    spatial_df["forest_ratio_300m"] >= 0.3,
-    "forest_ratio_score"
-] += 1
-
-spatial_df.loc[
-    spatial_df["forest_ratio_300m"] >= 0.5,
-    "forest_ratio_score"
-] += 2
-
-spatial_df.loc[
-    spatial_df["forest_ratio_300m"] >= 0.7,
-    "forest_ratio_score"
-] += 3
-
-spatial_df.loc[
-    spatial_df["forest_ratio_500m"] >= 0.3,
-    "forest_ratio_score"
-] += 1
-
-spatial_df.loc[
-    spatial_df["forest_ratio_500m"] >= 0.5,
-    "forest_ratio_score"
-] += 2
-
-spatial_df.loc[
-    spatial_df["forest_ratio_500m"] >= 0.7,
-    "forest_ratio_score"
-] += 2
-
-
-# 경사도 점수 계산: 경사가 클수록 확산 위험 증가
-spatial_df.loc[
-    spatial_df["pole_slope"] >= 10,
-    "pole_slope_score"
-] += 2
-
-spatial_df.loc[
-    spatial_df["pole_slope"] >= 20,
-    "pole_slope_score"
-] += 3
-
-spatial_df.loc[
-    spatial_df["pole_slope"] >= 30,
-    "pole_slope_score"
-] += 4
-
-
-# 고도 점수 계산: 보조 지형 변수로 낮은 비중 반영
-spatial_df.loc[
-    spatial_df["pole_height"] >= 300,
-    "pole_height_score"
-] += 1
-
-spatial_df.loc[
-    spatial_df["pole_height"] >= 600,
-    "pole_height_score"
-] += 2
-
-spatial_df.loc[
-    spatial_df["pole_height"] >= 900,
-    "pole_height_score"
-] += 2
-
-
-# 공간 위험 점수 계산
-spatial_score_cols = [
-    "forest_distance_score",
-    "spatial_risk_scaled_score",
-    "forest_ratio_score",
-    "pole_slope_score",
-    "pole_height_score",
-]
-
-spatial_df["spatial_risk_score"] = spatial_df[spatial_score_cols].sum(axis=1)
+# 공간위험도 계산
+spatial_df["spatial_risk_score"] = (
+    spatial_df["forest_ratio_100m_risk"] * SPATIAL_RATIO_100M_WEIGHT
+    + spatial_df["forest_ratio_300m_risk"] * SPATIAL_RATIO_300M_WEIGHT
+    + spatial_df["forest_ratio_500m_risk"] * SPATIAL_RATIO_500M_WEIGHT
+    + spatial_df["forest_distance_risk"] * SPATIAL_DISTANCE_WEIGHT
+    + spatial_df["spatial_risk_scaled_risk"] * SPATIAL_SCALED_WEIGHT
+    + spatial_df["slope_risk"] * SPATIAL_SLOPE_WEIGHT
+    + spatial_df["elevation_risk"] * SPATIAL_ELEVATION_WEIGHT
+)
 
 
 # 공간 위험 점수 결과 저장
@@ -657,11 +544,13 @@ spatial_result = spatial_df[
         "forest_ratio_500m",
         "pole_slope",
         "pole_height",
-        "forest_distance_score",
-        "spatial_risk_scaled_score",
-        "forest_ratio_score",
-        "pole_slope_score",
-        "pole_height_score",
+        "forest_ratio_100m_risk",
+        "forest_ratio_300m_risk",
+        "forest_ratio_500m_risk",
+        "forest_distance_risk",
+        "spatial_risk_scaled_risk",
+        "slope_risk",
+        "elevation_risk",
         "spatial_risk_score",
     ]
 ].copy()
@@ -694,11 +583,13 @@ print(
             "rank",
             "pole_id",
             "spatial_risk_score",
-            "forest_distance_score",
-            "spatial_risk_scaled_score",
-            "forest_ratio_score",
-            "pole_slope_score",
-            "pole_height_score",
+            "forest_ratio_100m_risk",
+            "forest_ratio_300m_risk",
+            "forest_ratio_500m_risk",
+            "forest_distance_risk",
+            "spatial_risk_scaled_risk",
+            "slope_risk",
+            "elevation_risk",
         ]
     ].head(20)
 )
@@ -710,10 +601,19 @@ print("\n최종 위험도 계산 시작")
 print(final_df.shape)
 
 
-# 최종 위험도 계산
-final_df["final_risk_score"] = (
+# 최종 위험도
+# 상호작용위험도 계산
+final_df["interaction_risk_score"] = (
     final_df["weather_risk_score"]
-    + final_df["spatial_risk_score"]
+    * final_df["spatial_risk_score"]
+)
+
+
+# 최종위험도 계산
+final_df["final_risk_score"] = (
+    final_df["weather_risk_score"] * FINAL_WEATHER_WEIGHT
+    + final_df["spatial_risk_score"] * FINAL_SPATIAL_WEIGHT
+    + final_df["interaction_risk_score"] * FINAL_INTERACTION_WEIGHT
 )
 
 
@@ -755,6 +655,7 @@ final_result = final_df[
         "lat",
         "weather_risk_score",
         "spatial_risk_score",
+        "interaction_risk_score",
         "final_risk_score",
         "decision",
         "risk_level",
