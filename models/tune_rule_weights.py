@@ -48,6 +48,15 @@ COMPONENT_COLUMNS = [
 ]
 
 
+# 최종 가중치 탐색 범위
+# proxy 성능과 전력설비 우선관리 도메인 조건을 함께 반영
+WEIGHT_CONSTRAINTS = {
+    "weather_risk_score": (0.50, 0.70),
+    "spatial_risk_score": (0.20, 0.40),
+    "interaction_risk_score": (0.05, 0.20),
+}
+
+
 def parse_years(value):
     """연도 문자열 → 정수 리스트 변환."""
     return [int(year.strip()) for year in value.split(",") if year.strip()]
@@ -260,54 +269,35 @@ def make_weighted_score(X, weights):
     return sum(X[column] * weights[column] for column in COMPONENT_COLUMNS)
 
 
-def best_top_rate_for_weights(X, y, weights, min_top_rate=0.01, max_top_rate=0.50):
-    """주어진 가중치에서 F1이 최대가 되는 컷(top_rate)을 정확히 계산.
-
-    점수를 내림차순으로 정렬한 뒤, "상위 k개를 1로 찍을 때"의 F1을
-    k=1..n 전부에 대해 누적으로 구해 그중 최댓값을 고른다.
-    5개 후보를 샘플링하는 대신, 가능한 모든 컷을 한 번에 평가하는 방식.
-    """
-    score = np.asarray(make_weighted_score(X, weights), dtype=float)
-    y = np.asarray(y, dtype=int)
-    n = len(y)
-    P = int(y.sum())
-
-    # 양성이 하나도 없으면 컷을 정할 수 없으므로 중앙값으로 fallback
-    if P == 0 or n == 0:
-        return {
-            "top_rate": 0.5,
-            "threshold": float(np.median(score)) if n else 0.0,
-            "f1": 0.0,
-            "precision": 0.0,
-            "recall": 0.0,
-        }
-
-    order = np.argsort(-score)          # 점수 내림차순 정렬
-    y_sorted = y[order]
-    score_sorted = score[order]
-
-    tp = np.cumsum(y_sorted)            # 상위 k개 선택 시 누적 TP
-    k = np.arange(1, n + 1)
-    precision = tp / k
-    recall = tp / P
-    denom = precision + recall
-    f1 = np.where(denom > 0, 2 * precision * recall / denom, 0.0)
-
-    # 운영상 의미가 없거나 불안정한 극단 컷은 후보에서 제외
-    low_k = max(1, int(np.ceil(min_top_rate * n)))
-    high_k = max(low_k, int(np.floor(max_top_rate * n)))
-    mask = np.zeros(n, dtype=bool)
-    mask[low_k - 1:high_k] = True
-    f1_masked = np.where(mask, f1, -1.0)
-
-    best_k = int(np.argmax(f1_masked)) + 1
-    return {
-        "top_rate": best_k / n,
-        "threshold": float(score_sorted[best_k - 1]),
-        "f1": float(f1[best_k - 1]),
-        "precision": float(precision[best_k - 1]),
-        "recall": float(recall[best_k - 1]),
+def make_constrained_weights(weather_weight, spatial_weight):
+    """제약 조건을 만족하는 최종 가중치 생성."""
+    interaction_weight = 1.0 - weather_weight - spatial_weight
+    weights = {
+        "weather_risk_score": weather_weight,
+        "spatial_risk_score": spatial_weight,
+        "interaction_risk_score": interaction_weight,
     }
+
+    for column, value in weights.items():
+        min_value, max_value = WEIGHT_CONSTRAINTS[column]
+        if value < min_value or value > max_value:
+            return None
+
+    return weights
+
+
+def sample_constrained_weights_with_rng(rng):
+    """무작위 탐색용 제약 가중치 샘플링."""
+    weather_min, weather_max = WEIGHT_CONSTRAINTS["weather_risk_score"]
+    spatial_min, spatial_max = WEIGHT_CONSTRAINTS["spatial_risk_score"]
+    interaction_min, interaction_max = WEIGHT_CONSTRAINTS["interaction_risk_score"]
+
+    weather_weight = rng.uniform(weather_min, weather_max)
+    spatial_low = max(spatial_min, 1.0 - weather_weight - interaction_max)
+    spatial_high = min(spatial_max, 1.0 - weather_weight - interaction_min)
+    spatial_weight = rng.uniform(spatial_low, spatial_high)
+
+    return make_constrained_weights(weather_weight, spatial_weight)
 
 
 def evaluate_weight_candidate(X, y, weights, top_rate):
@@ -322,31 +312,32 @@ def evaluate_weight_candidate(X, y, weights, top_rate):
 
 
 def random_search_weights(X_train, y_train, X_valid, y_valid, n_trials, output_dir):
-    """Optuna 미설치 시 무작위 후보 탐색."""
+    """Optuna 미설치 시 제약 기반 무작위 후보 탐색."""
     rng = np.random.default_rng(42)
+    top_rates = [0.05, 0.10, 0.15, 0.20, 0.30]
     rows = []
 
     for trial in range(n_trials):
-        sampled = rng.dirichlet(np.ones(len(COMPONENT_COLUMNS)))
-        weights = dict(zip(COMPONENT_COLUMNS, sampled))
-        # top_rate 그리드 루프 제거: 가중치별 최적 컷을 직접 계산
-        train_cut = best_top_rate_for_weights(X_train, y_train, weights)
-        train_metrics = evaluate_weight_candidate(
-            X_train, y_train, weights, train_cut["top_rate"]
-        )
-        valid_cut = best_top_rate_for_weights(X_valid, y_valid, weights)
-        valid_metrics = evaluate_weight_candidate(
-            X_valid, y_valid, weights, valid_cut["top_rate"]
-        )
-        rows.append(
-            {
+        weights = sample_constrained_weights_with_rng(rng)
+        if weights is None:
+            continue
+
+        for top_rate in top_rates:
+            train_metrics = evaluate_weight_candidate(
+                X_train, y_train, weights, top_rate
+            )
+            valid_metrics = evaluate_weight_candidate(
+                X_valid, y_valid, weights, top_rate
+            )
+            row = {
                 "trial": trial,
-                "method": "random_search",
+                "method": "constrained_random_search",
+                "constraint_note": "weather 0.50-0.70, spatial 0.20-0.40, interaction 0.05-0.20, sum=1",
                 **{f"weight_{key}": value for key, value in weights.items()},
                 **{f"train_{key}": value for key, value in train_metrics.items()},
                 **{f"valid_{key}": value for key, value in valid_metrics.items()},
             }
-        )
+            rows.append(row)
 
     result = pd.DataFrame(rows).sort_values(
         ["train_f1", "train_recall", "valid_f1"], ascending=False
@@ -356,44 +347,45 @@ def random_search_weights(X_train, y_train, X_valid, y_valid, n_trials, output_d
 
 
 def optuna_search_weights(X_train, y_train, X_valid, y_valid, n_trials, output_dir):
-    """Optuna 기반 가중치/threshold 후보 탐색."""
+    """Optuna 기반 제약 가중치/threshold 후보 탐색."""
     if optuna is None:
         return random_search_weights(
             X_train, y_train, X_valid, y_valid, n_trials, output_dir
         )
 
+    top_rates = [0.05, 0.10, 0.15, 0.20, 0.30]
     rows = []
 
     def objective(trial):
-        # 가중치 합 1 정규화
-        raw_weights = np.array(
-            [
-                trial.suggest_float(column, 0.0, 1.0)
-                for column in COMPONENT_COLUMNS
-            ]
-        )
-        if raw_weights.sum() == 0:
-            weights_array = np.ones(len(COMPONENT_COLUMNS)) / len(COMPONENT_COLUMNS)
-        else:
-            weights_array = raw_weights / raw_weights.sum()
-        weights = dict(zip(COMPONENT_COLUMNS, weights_array))
+        # 도메인 제약 조건 내에서 가중치 탐색
+        weather_min, weather_max = WEIGHT_CONSTRAINTS["weather_risk_score"]
+        spatial_min, spatial_max = WEIGHT_CONSTRAINTS["spatial_risk_score"]
+        interaction_min, interaction_max = WEIGHT_CONSTRAINTS["interaction_risk_score"]
 
-        # top_rate는 더 이상 샘플하지 않는다.
-        # 가중치가 정해지면 컷은 정답이 있는 계산 문제이므로 직접 최적값을 구한다.
-        # 가중치 선택은 train(4개 연도, 더 안정적) 기준으로 한다.
-        train_cut = best_top_rate_for_weights(X_train, y_train, weights)
-        train_metrics = evaluate_weight_candidate(
-            X_train, y_train, weights, train_cut["top_rate"]
+        weather_weight = trial.suggest_float(
+            "weather_risk_score",
+            weather_min,
+            weather_max,
         )
-        # valid 성능은 valid 자체의 최적 컷에서 측정해 일반화 정도를 함께 기록
-        valid_cut = best_top_rate_for_weights(X_valid, y_valid, weights)
-        valid_metrics = evaluate_weight_candidate(
-            X_valid, y_valid, weights, valid_cut["top_rate"]
+        spatial_low = max(spatial_min, 1.0 - weather_weight - interaction_max)
+        spatial_high = min(spatial_max, 1.0 - weather_weight - interaction_min)
+        spatial_weight = trial.suggest_float(
+            "spatial_risk_score",
+            spatial_low,
+            spatial_high,
         )
+        weights = make_constrained_weights(weather_weight, spatial_weight)
+        if weights is None:
+            return 0.0
+
+        top_rate = trial.suggest_categorical("top_rate", top_rates)
+        train_metrics = evaluate_weight_candidate(X_train, y_train, weights, top_rate)
+        valid_metrics = evaluate_weight_candidate(X_valid, y_valid, weights, top_rate)
         rows.append(
             {
                 "trial": trial.number,
-                "method": "optuna",
+                "method": "constrained_optuna",
+                "constraint_note": "weather 0.50-0.70, spatial 0.20-0.40, interaction 0.05-0.20, sum=1",
                 **{f"weight_{key}": value for key, value in weights.items()},
                 **{f"train_{key}": value for key, value in train_metrics.items()},
                 **{f"valid_{key}": value for key, value in valid_metrics.items()},
@@ -516,30 +508,10 @@ def main():
     # Random Forest 기반 중요도 보조 검증
     fit_random_forest(X, y_train, X, y_valid, output_dir)
 
-    # Optuna 기반 가중치 탐색 (컷은 가중치별 최적값을 직접 계산)
+    # Optuna 기반 가중치/threshold 후보 탐색
     best = optuna_search_weights(
         X, y_train, X, y_valid, args.n_trials, output_dir
     )
-
-    # 최종 컷(0/1 기준)은 검증연도(2024)에서 F1 최대가 되는 지점으로 정한다.
-    # 가중치는 train(4개 연도)으로 안정적으로 고르고, 0/1 경계선만
-    # test에 가장 가까운 미래 데이터(valid)에서 맞춘다.
-    best_weights = {
-        column: float(best[f"weight_{column}"]) for column in COMPONENT_COLUMNS
-    }
-    valid_cut = best_top_rate_for_weights(X, y_valid, best_weights)
-    train_cut = best_top_rate_for_weights(X, y_train, best_weights)
-
-    best["recommended_top_rate"] = valid_cut["top_rate"]
-    best["recommended_threshold"] = valid_cut["threshold"]
-    best["recommended_valid_f1"] = valid_cut["f1"]
-    best["recommended_valid_precision"] = valid_cut["precision"]
-    best["recommended_valid_recall"] = valid_cut["recall"]
-    best["cut_selected_on"] = "validation"
-    # 참고용: train에서 고른 컷과 비교하면 컷의 안정성을 가늠할 수 있다.
-    best["train_optimal_top_rate"] = train_cut["top_rate"]
-    best["train_optimal_f1"] = train_cut["f1"]
-
     save_json(best, output_dir / "recommended_weight_threshold.json")
 
     print("\n가중치 튜닝 완료")
@@ -550,12 +522,6 @@ def main():
         print(f"- {key}: {value:.4f}")
     print("\n탐색 기반 추천 후보")
     print(json.dumps(best, ensure_ascii=False, indent=2))
-
-    print("\n0/1 컷(top_rate) 안정성 점검")
-    print(f"- train 최적 컷: {train_cut['top_rate']:.4f} (f1={train_cut['f1']:.4f})")
-    print(f"- valid 최적 컷: {valid_cut['top_rate']:.4f} (f1={valid_cut['f1']:.4f})")
-    print("  → 두 컷이 비슷하면 안정적, 크게 다르면 과적합 의심")
-    print(f"- 실제 적용 컷(추천): {valid_cut['top_rate']:.4f} (검증연도 기준)")
 
 
 if __name__ == "__main__":

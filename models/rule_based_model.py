@@ -104,10 +104,7 @@ if WEIGHT_TUNING_PATH.exists():
         "weight_interaction_risk_score",
         FINAL_INTERACTION_WEIGHT,
     )
-    FINAL_TOP_RATE = tuned.get(
-        "recommended_top_rate",
-        tuned.get("train_top_rate", tuned.get("top_rate")),
-    )
+    FINAL_TOP_RATE = tuned.get("train_top_rate", tuned.get("top_rate"))
 
     print("\n가중치 튜닝 결과 적용")
     print(f"- weather: {FINAL_WEATHER_WEIGHT:.4f}")
